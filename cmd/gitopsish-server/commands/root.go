@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"time"
 
+	"github.com/google/go-github/github"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/gorilla/mux"
@@ -30,6 +32,11 @@ import (
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/spf13/viper"
 )
+
+type feelings struct {
+	srv        *http.Server
+	friendship map[string]*github.User
+}
 
 var cfgFile string
 
@@ -46,26 +53,39 @@ to quickly create a Cobra application.`,
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	Run: func(cmd *cobra.Command, args []string) {
-		for {
-			ctx := context.Background()
-			ctx, cancel := context.WithCancel(ctx)
-			r := mux.NewRouter()
-			// Add your routes as needed
+		var wait time.Duration
+		ctx, cancel := context.WithTimeout(context.Background(), wait)
+		r := mux.NewRouter()
+		// Add your routes as needed
+		r.HandleFunc("/", register)
+		r.HandleFunc("/are-you-ok", okayish)
+		r.HandleFunc("/callback", callback)
 
-			srv := &http.Server{
-				Addr: "0.0.0.0:8080",
-				// Good practice to set timeouts to avoid Slowloris attacks.
-				WriteTimeout: time.Second * 15,
-				ReadTimeout:  time.Second * 15,
-				IdleTimeout:  time.Second * 60,
-				Handler:      r, // Pass our instance of gorilla/mux in.
-			}
+		srv := &http.Server{
+			Addr:         "127.0.0.1:9999",
+			WriteTimeout: time.Second * 15,
+			ReadTimeout:  time.Second * 15,
+			IdleTimeout:  time.Second * 60,
+			Handler:      r, // Pass our instance of gorilla/mux in.
+		}
+		go func() {
+			log.Info("starting webserver...")
 			if err := srv.ListenAndServe(); err != nil {
 				log.Println(err)
 			}
-			cancel()
-		}
+		}()
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
 
+		<-c
+
+		defer cancel()
+		err := srv.Shutdown(ctx)
+		if err != nil {
+			log.Fatal("failed graceful shutdown")
+		}
+		log.Println("shutting down")
+		os.Exit(0)
 	},
 }
 
@@ -116,4 +136,39 @@ func initConfig() {
 	if err := viper.ReadInConfig(); err == nil {
 		fmt.Println("Using config file:", viper.ConfigFileUsed())
 	}
+}
+
+func okayish(w http.ResponseWriter, r *http.Request) {
+	if ok := r.URL.Query().Get("really"); ok == "true" {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, err := w.Write([]byte("permission denied"))
+		if err != nil {
+			log.Info("failed to response")
+		}
+	} else {
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte("ok"))
+		if err != nil {
+			log.Info("failed to response")
+		}
+	}
+}
+
+func callback(w http.ResponseWriter, r *http.Request) {
+	// TODO(igaskin) implement callback
+	// * parse out the "code"
+	// * check if the user is following me
+	log.Info(r.Header)
+	log.Info(r.URL.Query())
+}
+
+func register(w http.ResponseWriter, r *http.Request) {
+	req, _ := http.NewRequest(http.MethodGet, "https://github.com/login/oauth/authorize", nil)
+	q := req.URL.Query()
+	q.Add("client_id", os.Getenv("CLIENT_ID"))
+	q.Add("redirect_uri", "http://localhost:9999/callback")
+	q.Add("scope", "read:user")
+	req.URL.RawQuery = q.Encode()
+
+	http.Redirect(w, r, req.URL.String(), http.StatusSeeOther)
 }

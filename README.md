@@ -4,19 +4,16 @@
 ## Trending Buzzwords
 Everything is fun an entertaining when it has cool words associated with it
 
-> How does oen find happiness in the abyss?
+> How does one find happiness in the abyss?
 
 ## Checking if everything is ok?
 
-```
-curl localhost:6391/are-you-ok
+```bash
+curl localhost:9999/are-you-ok
+ok
 
-200
-
-curl localhost:6391/are-you-ok?really=true
-
-403
-
+curl  localhost:9999/are-you-ok\?really=true
+permission denied
 
 curl --Header Authorization: <friendship-token> localhost:6391/are-you-ok?really=true
 {
@@ -24,6 +21,3 @@ curl --Header Authorization: <friendship-token> localhost:6391/are-you-ok?really
 msg: "wake me up when september ends"
 }
 ```
-
-
-
