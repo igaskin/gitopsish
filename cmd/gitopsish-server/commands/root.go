@@ -18,13 +18,17 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"time"
 
 	"github.com/google/go-github/github"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/oauth2"
+	"k8s.io/apimachinery/pkg/util/uuid"
 
 	"github.com/gorilla/mux"
 	"github.com/spf13/cobra"
@@ -33,9 +37,14 @@ import (
 	"github.com/spf13/viper"
 )
 
+const (
+	targetUser = "igaskin"
+)
+
 type feelings struct {
-	srv        *http.Server
-	friendship map[string]*github.User
+	srv            *http.Server
+	friendship     map[string]*github.User
+	stateToCodeMap map[string]string
 }
 
 var cfgFile string
@@ -56,21 +65,25 @@ to quickly create a Cobra application.`,
 		var wait time.Duration
 		ctx, cancel := context.WithTimeout(context.Background(), wait)
 		r := mux.NewRouter()
-		// Add your routes as needed
-		r.HandleFunc("/", register)
-		r.HandleFunc("/are-you-ok", okayish)
-		r.HandleFunc("/callback", callback)
-
-		srv := &http.Server{
-			Addr:         "127.0.0.1:9999",
-			WriteTimeout: time.Second * 15,
-			ReadTimeout:  time.Second * 15,
-			IdleTimeout:  time.Second * 60,
-			Handler:      r, // Pass our instance of gorilla/mux in.
+		feelme := feelings{
+			srv: &http.Server{
+				Addr:         "127.0.0.1:9999",
+				WriteTimeout: time.Second * 15,
+				ReadTimeout:  time.Second * 15,
+				IdleTimeout:  time.Second * 60,
+				Handler:      r, // Pass our instance of gorilla/mux in.
+			},
+			friendship:     make(map[string]*github.User),
+			stateToCodeMap: make(map[string]string),
 		}
+		// Add your routes as needed
+		r.HandleFunc("/", feelme.register)
+		r.HandleFunc("/are-you-ok", feelme.okayish)
+		r.HandleFunc("/callback", feelme.callback)
+
 		go func() {
-			log.Info("starting webserver...")
-			if err := srv.ListenAndServe(); err != nil {
+			log.Infof("starting webserver on %v", feelme.srv.Addr)
+			if err := feelme.srv.ListenAndServe(); err != nil {
 				log.Println(err)
 			}
 		}()
@@ -80,7 +93,7 @@ to quickly create a Cobra application.`,
 		<-c
 
 		defer cancel()
-		err := srv.Shutdown(ctx)
+		err := feelme.srv.Shutdown(ctx)
 		if err != nil {
 			log.Fatal("failed graceful shutdown")
 		}
@@ -138,7 +151,7 @@ func initConfig() {
 	}
 }
 
-func okayish(w http.ResponseWriter, r *http.Request) {
+func (f *feelings) okayish(w http.ResponseWriter, r *http.Request) {
 	if ok := r.URL.Query().Get("really"); ok == "true" {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, err := w.Write([]byte("permission denied"))
@@ -154,20 +167,79 @@ func okayish(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func callback(w http.ResponseWriter, r *http.Request) {
-	// TODO(igaskin) implement callback
-	// * parse out the "code"
-	// * check if the user is following me
-	log.Info(r.Header)
-	log.Info(r.URL.Query())
+func (f *feelings) callback(w http.ResponseWriter, r *http.Request) {
+	if code := r.URL.Query().Get("code"); code != "" {
+		req, _ := http.NewRequest(http.MethodPost, "https://github.com/login/oauth/access_token", nil)
+		q := req.URL.Query()
+		q.Add("client_id", os.Getenv("CLIENT_ID"))
+		q.Add("client_secret", os.Getenv("CLIENT_SECRET"))
+		q.Add("code", code)
+		q.Add("redirect_uri", "http://localhost:9999/callback")
+		q.Add("state", r.URL.Query().Get("state")) // figure out how to store this state
+		req.URL.RawQuery = q.Encode()
+
+		res, _ := http.DefaultClient.Do(req)
+
+		defer res.Body.Close()
+		body, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			log.Warn("unable to read response body")
+		}
+		responseQuery, err := url.ParseQuery(string(body))
+		if err != nil {
+			log.Warn("unable to read response query")
+		}
+		if token := responseQuery.Get("access_token"); token != "" {
+			log.Info("sucessfully authenticated user")
+			ctx := context.Background()
+			ts := oauth2.StaticTokenSource(
+				&oauth2.Token{AccessToken: token},
+			)
+			tc := oauth2.NewClient(ctx, ts)
+			gh := github.NewClient(tc)
+			isFollowing, _, err := gh.Users.IsFollowing(ctx, "", targetUser)
+			if err != nil {
+				log.Warn("unable to check following status")
+			}
+			currentUser, _, _ := gh.Users.Get(ctx, "")
+			if isFollowing {
+				log.Infof("%s is following me!", *currentUser.Login)
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte("existance is torment"))
+				if err != nil {
+					log.Info("failed to respond")
+				}
+			} else {
+				log.Info()
+				w.WriteHeader(http.StatusPreconditionFailed)
+				_, err := w.Write([]byte(fmt.Sprintf("%s, please follow me first here: https://github.com/%s", *currentUser.Login, targetUser)))
+				if err != nil {
+					log.Info("failed to respond")
+				}
+			}
+
+		}
+		responseParams, err := url.ParseQuery(string(body))
+		if err != nil {
+			log.Warn("unable to parse oauth response")
+		}
+		if err := responseParams.Get("error"); err != "" {
+			log.Warn(responseParams)
+		}
+		log.Info(res.Status)
+	}
 }
 
-func register(w http.ResponseWriter, r *http.Request) {
+func (f *feelings) register(w http.ResponseWriter, r *http.Request) {
+	// TODO(igaskin) add cookies to maintain state
 	req, _ := http.NewRequest(http.MethodGet, "https://github.com/login/oauth/authorize", nil)
 	q := req.URL.Query()
+	state := string(uuid.NewUUID())
+	f.stateToCodeMap[state] = ""
 	q.Add("client_id", os.Getenv("CLIENT_ID"))
 	q.Add("redirect_uri", "http://localhost:9999/callback")
 	q.Add("scope", "read:user")
+	q.Add("state", state)
 	req.URL.RawQuery = q.Encode()
 
 	http.Redirect(w, r, req.URL.String(), http.StatusSeeOther)
